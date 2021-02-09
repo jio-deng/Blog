@@ -1,3 +1,536 @@
+# 写在前面
+
+基于android-30源码进行分析
+
+---
+
+# 知识储备
+
+### 1. LinearLayout属性baselineAligned的作用及baseline
+
+原文链接：[LinearLayout属性baselineAligned的作用及baseline][1]
+
+```
+android:baselineAligned="false" 设置文本的对齐方式，默认为true，按照基线对齐 在同一个线性布局中的元素生效
+android:baselineAlignedChildIndex="0" 设置需要[被对齐]的元素所在位置,设置不同线性布局中元素的对齐位置
+```
+
+### 2. LinearLayout之Weight/measureWithLargestChild详解
+
+原文链接：[LinearLayout之Weight/measureWithLargestChild详解][2]
+
+```
+android:measureWithLargestChild作用 : 该属性为true的时候,所有带权重的子元素都会具有最大子元素的最小尺寸;
+且只有当父view布局方向上的宽度或高度为wrap_content才有效
+```
+
+### 3. LinearLayout分隔符妙用
+
+原文链接：[LinearLayout分隔符妙用][3]
+
+LinearLayout可以通过设置showDividers属性来为所有item的前、之间、后添加一个drawable:
+
+```
+showDividers：divider显示的位置，默认是none，不显示divider，其它值有beginning（第0个child前面），middle（每个child之间），end（最后一个child后面），这些值可以通过'|'组合起来使用，比如你可以指定"beginning|middle|end"；
+divider：具体长什么样的分隔符，是一个drawable，注意这里不能简单只给个颜色值，比如#f00或者@color/xxx这样，drawable一定要是个有长、宽概念的drawable，比如你可以纯粹用一张图片当divider
+```
+
+### 4. TabRow
+介绍：[android-TableLayout以及TableRow的使用][5]
+
+---
+
+# LinearLayout.onMeasure源码分析
+
+兄弟们，冲！
+
+![牛牛，冲！](https://img-blog.csdnimg.cn/20210208223705803.jpeg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2FzZDUwMTgyMzIwNg==,size_16,color_FFFFFF,t_70#pic_center)
+
+首先，LinearLayout会根据设置的orientation来调用不同的函数。
+
+```
+@Override
+protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+    if (mOrientation == VERTICAL) {
+        measureVertical(widthMeasureSpec,heightMeasureSpec);
+    } else {
+        measureHorizontal(widthMeasureSpec,heightMeasureSpec);
+    }
+}
+```
+
+## Vertical
+```
+void measureVertical(int widthMeasureSpec, int heightMeasureSpec) {
+    ···
+}
+```
+
+这个函数特别的长（Gerrit提示函数不要超过20行hhh），我们把它拆开来看。
+
+### 变量
+
+方法刚开始初始化的变量，有用于后续的循环遍历子view时记录的高度、宽度、权重，以及读取在初始化时读取的style中的值；这里最重要的就是高度（竖直方向嘛）；具体含义直接标在代码里：
+
+```
+        mTotalLength = 0; // 当前总高度
+        int maxWidth = 0; // 最大宽度
+        int childState = 0; // state，保存状态，后续可以用MASK将size取出来
+
+        // 因为weight重新计算的原因，这里分成了两个
+        int alternativeMaxWidth = 0; // 不带weight的child的最大宽度
+        int weightedMaxWidth = 0; // 带weight的child的最大宽度
+
+        boolean allFillParent = true; // 是否所有的child都宽度撑满了
+        float totalWeight = 0; // 总weight
+
+        final int count = getVirtualChildCount(); // child数量
+
+        // 读取传进来的parent的宽高MeasureSpecMode
+        final int widthMode = MeasureSpec.getMode(widthMeasureSpec);
+        final int heightMode = MeasureSpec.getMode(heightMeasureSpec);
+
+        boolean matchWidth = false; // 是否具有MATCH_PARENT的child，且parent不为EXACTLY；此时当LinearLayout知晓宽度后，需要重新计算对应view的宽度
+        boolean skippedMeasure = false; // 优化weight计算过程的标志
+
+        // baseline基于的child的index，如果没设置为-1，更多详细内容见知识储备【1】
+        final int baselineChildIndex = mBaselineAlignedChildIndex;
+        // 是否使用measureWithLargestChild，更多详细内容见知识储备【2】
+        final boolean useLargestChild = mUseLargestChild;
+
+        int largestChildHeight = Integer.MIN_VALUE; // 和上面的useLargestChild呼应，记录最大的child高度
+        int consumedExcessSpace = 0; // 已经被使用的剩余空间有多少
+
+        int nonSkippedChildCount = 0; // 统计需要计算的child的数量，对应TabRow里会跳过一些child
+```
+
+### 第一个for循环
+
+接下来是几个for循环，我们先来看第一个，上面还有一行温馨提示：看看大伙都多高，记录一下最大宽度
+
+```
+        // 第一个循环：算高度、算宽度，略过带weight的child
+        // See how tall everyone is. Also remember max width.
+        // 看看大伙都多高，记录一下最大宽度
+        for (int i = 0; i < count; ++i) {
+            // LineaLayout中获取child位置时都用的这个方法：getVirtualChildAt(i)，是为TabRow提供兼容，当前的child可以是跳过几个之后的index；
+            // 我们只看LinearLayout的onMeasure过程时，只需要把它当成getChildAt就可以了；
+            final View child = getVirtualChildAt(i);
+
+            // measureNullChild在LinearLayout中返回0
+            if (child == null) {
+                mTotalLength += measureNullChild(i);
+                continue;
+            }
+
+            // 计算真正的i
+            if (child.getVisibility() == View.GONE) {
+               i += getChildrenSkipCount(child, i);
+               continue;
+            }
+
+            // 记录非空的child的数量
+            nonSkippedChildCount++;
+
+            // 判断是否有前后、中间的divider，详见知识储备【3】
+            // 计算总高度。这里如果有前后和中间的，会少加一个高度，在for循环之后会补上
+            if (hasDividerBeforeChildAt(i)) {
+                mTotalLength += mDividerHeight;
+            }
+
+            final LayoutParams lp = (LayoutParams) child.getLayoutParams();
+
+            totalWeight += lp.weight;
+
+            // 是否使用weight来计算高度（可以理解为瓜分剩余的空间～）
+            final boolean useExcessSpace = lp.height == 0 && lp.weight > 0;
+
+            // 这里进行的判断是：如果parent的高度已经固定了，那么此时使用weight能够瓜分的大小已经固定了；
+            // 而weight分得的大小再后面的逻辑中会计算，这里就不用计算了，直接跳过并使用skippedMeasure标记一下。
+            if (heightMode == MeasureSpec.EXACTLY && useExcessSpace) {
+                // Optimization: don't bother measuring children who are only
+                // laid out using excess space. These views will get measured
+                // later if we have space to distribute.
+                final int totalLength = mTotalLength;
+                mTotalLength = Math.max(totalLength, totalLength + lp.topMargin + lp.bottomMargin);
+                skippedMeasure = true;
+            } else {
+            // else中逻辑是计算child的高度并加入到mTotalLength中；
+            // 此时如果child是useExcessSpace的，parent的heightMode是AT_MOST或UNSPECIFIED，仍然需要计算child的最佳高度为多少，
+            // 具体做法就是将lp.height设置为WRAP_CONTENT，计算后重新设置为0，将计算所得的height加入到consumedExcessSpace中，
+            // 用于后续的关于weight的高度计算
+                if (useExcessSpace) {
+                    // The heightMode is either UNSPECIFIED or AT_MOST, and
+                    // this child is only laid out using excess space. Measure
+                    // using WRAP_CONTENT so that we can find out the view's
+                    // optimal height. We'll restore the original height of 0
+                    // after measurement.
+                    lp.height = LayoutParams.WRAP_CONTENT;
+                }
+
+                // Determine how big this child would like to be. If this or
+                // previous children have given a weight, then we allow it to
+                // use all available space (and we will shrink things later
+                // if needed).
+                // 计算出child的高度
+                // usedHeight的计算是因为前面说的，有weight的child是计算出它的最佳高度，所以被使用的高度穿进去0；
+                // 而正常的child传进去被用掉的高度，即mTotalLength
+                final int usedHeight = totalWeight == 0 ? mTotalLength : 0;
+                measureChildBeforeLayout(child, i, widthMeasureSpec, 0,
+                        heightMeasureSpec, usedHeight);
+
+                final int childHeight = child.getMeasuredHeight();
+                // 上下两个useExcessSpace呼应，算完了变回去，存一下值
+                if (useExcessSpace) {
+                    // Restore the original height and record how much space
+                    // we've allocated to excess-only children so that we can
+                    // match the behavior of EXACTLY measurement.
+                    lp.height = 0;
+                    // 被使用的剩余空间有多少
+                    consumedExcessSpace += childHeight;
+                }
+
+                // 更新一下mTotalLength
+                // 用上了max，毕竟margin这玩意能设置成负数hhh
+                // getNextLocationOffset不用管，TabRow的，LinearLayout里是0
+                final int totalLength = mTotalLength;
+                mTotalLength = Math.max(totalLength, totalLength + childHeight + lp.topMargin +
+                       lp.bottomMargin + getNextLocationOffset(child));
+
+                // 知识储备【2】，设置了useLargestChild后，其他child的高度都用这个；
+                // 这里只是保存，后面还有一个循环就是因为这个，再重新计算一遍
+                if (useLargestChild) {
+                    largestChildHeight = Math.max(childHeight, largestChildHeight);
+                }
+            }
+
+            /**
+             * If applicable, compute the additional offset to the child's baseline
+             * we'll need later when asked {@link #getBaseline}.
+             */
+            // 知识储备【1】，如果有baselineChild且下一个就是，那么记一下baselineChild的top
+            if ((baselineChildIndex >= 0) && (baselineChildIndex == i + 1)) {
+               mBaselineChildTop = mTotalLength;
+            }
+
+            // if we are trying to use a child index for our baseline, the above
+            // book keeping only works if there are no children above it with
+            // weight.  fail fast to aid the developer.
+            // 这里是说，baselineChild前不可以有使用weight的child
+            if (i < baselineChildIndex && lp.weight > 0) {
+                throw new RuntimeException("A child of LinearLayout with index "
+                        + "less than mBaselineAlignedChildIndex has weight > 0, which "
+                        + "won't work.  Either remove the weight, or don't set "
+                        + "mBaselineAlignedChildIndex.");
+            }
+
+            // 这里的matchWidthLocally是为了标记，是否该view的宽度为MATCH_PARENT，且parent不是EXACTLY；
+            // 因为这种情况下，当parent计算完宽度后才能再来计算child的宽度，所以这里的宽度计算也不用是精确的。
+            // matchWidth同理，方法内标注一下
+            boolean matchWidthLocally = false;
+            if (widthMode != MeasureSpec.EXACTLY && lp.width == LayoutParams.MATCH_PARENT) {
+                // The width of the linear layout will scale, and at least one
+                // child said it wanted to match our width. Set a flag
+                // indicating that we need to remeasure at least that view when
+                // we know our width.
+                matchWidth = true;
+                matchWidthLocally = true;
+            }
+
+            // 记录最大宽度
+            final int margin = lp.leftMargin + lp.rightMargin;
+            final int measuredWidth = child.getMeasuredWidth() + margin;
+            maxWidth = Math.max(maxWidth, measuredWidth);
+
+            // 将两个state用“｜”计算成一个
+            // 通过state和MASK可以拿出size的大小
+            childState = combineMeasuredStates(childState, child.getMeasuredState());
+
+            // 用于判断是否所有的child宽度就是直接撑满，有一个不是这里就断了，就变成false了
+            allFillParent = allFillParent && lp.width == LayoutParams.MATCH_PARENT;
+
+            // 如上所说，带weight的child后续要重新计算一次，这里把它和其他的child的最大宽度分别保存一下
+            if (lp.weight > 0) {
+                /*
+                 * Widths of weighted Views are bogus if we end up
+                 * remeasuring, so keep them separate.
+                 */
+                weightedMaxWidth = Math.max(weightedMaxWidth,
+                        matchWidthLocally ? margin : measuredWidth);
+            } else {
+                alternativeMaxWidth = Math.max(alternativeMaxWidth,
+                        matchWidthLocally ? margin : measuredWidth);
+            }
+
+            // TabRow用的，这里当没看见叭
+            i += getChildrenSkipCount(child, i);
+        }
+```
+
+### 第二个for循环
+
+```
+        // 这里就是前面说的少算了一个，在这里补上了
+        if (nonSkippedChildCount > 0 && hasDividerBeforeChildAt(count)) {
+            mTotalLength += mDividerHeight;
+        }
+
+        // 第二个for循环：useLargestChild的情况下，parent的大小不固定时，把child高度都换成最大高度
+        if (useLargestChild &&
+                (heightMode == MeasureSpec.AT_MOST || heightMode == MeasureSpec.UNSPECIFIED)) {
+            mTotalLength = 0;
+
+            for (int i = 0; i < count; ++i) {
+                // 前面和第一个循环一样
+                final View child = getVirtualChildAt(i);
+                if (child == null) {
+                    mTotalLength += measureNullChild(i);
+                    continue;
+                }
+
+                if (child.getVisibility() == GONE) {
+                    i += getChildrenSkipCount(child, i);
+                    continue;
+                }
+
+                // 这里发现计算时加的高度都是最大child的高度了
+                final LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams)
+                        child.getLayoutParams();
+                // Account for negative margins
+                final int totalLength = mTotalLength;
+                mTotalLength = Math.max(totalLength, totalLength + largestChildHeight +
+                        lp.topMargin + lp.bottomMargin + getNextLocationOffset(child));
+            }
+        }
+```
+
+### 第三个for循环
+
+```
+        // Add in our padding 
+        // 加上自身的上下padding
+        mTotalLength += mPaddingTop + mPaddingBottom;
+
+        int heightSize = mTotalLength;
+
+        // Check against our minimum height （minHeight这个属性）
+        heightSize = Math.max(heightSize, getSuggestedMinimumHeight());
+
+        // Reconcile our calculated size with the heightMeasureSpec
+        // 将我们计算出的尺寸与heightMeasureSpec进行协调，
+        // 这个协调方法就是根据parent的mode，来判断我们要使用parent传进来的高度，还是我们计算出的我们想要的高度
+        int heightSizeAndState = resolveSizeAndState(heightSize, heightMeasureSpec, 0);
+        heightSize = heightSizeAndState & MEASURED_SIZE_MASK;
+
+        // Either expand children with weight to take up available space or
+        // shrink them if they extend beyond our current bounds. If we skipped
+        // measurement on any children, we need to measure them now.
+        // 计算剩余的空间大小
+        int remainingExcess = heightSize - mTotalLength
+                + (mAllowInconsistentMeasurement ? 0 : consumedExcessSpace);
+
+        // 第三次循环：如果我们之前跳过了带weight的child的measure，或是totalWeight > 0，就需要重新计算一遍，因为现在我们知道了LinearLayout的高度
+        // 这里的判断条件sRemeasureWeightedChildren，从Android P之后默认为true了
+        if (skippedMeasure
+                || ((sRemeasureWeightedChildren || remainingExcess != 0) && totalWeight > 0.0f)) {
+
+            // 计算出剩余的weight，按照比列将剩余空间分配给各个child；同理，如果我们当前使用的空间超过了限制，那么就是按比例扣去这部分～
+            float remainingWeightSum = mWeightSum > 0.0f ? mWeightSum : totalWeight;
+
+            mTotalLength = 0;
+
+            for (int i = 0; i < count; ++i) {
+                // 每个循环前面都一样～
+                final View child = getVirtualChildAt(i);
+                if (child == null || child.getVisibility() == View.GONE) {
+                    continue;
+                }
+
+                final LayoutParams lp = (LayoutParams) child.getLayoutParams();
+                final float childWeight = lp.weight;
+
+                // 只有带weight的才重新计算
+                if (childWeight > 0) {
+                    final int share = (int) (childWeight * remainingExcess / remainingWeightSum);
+                    remainingExcess -= share;
+                    remainingWeightSum -= childWeight;
+
+                    // 重新计算高度，判断条件都是老几样，就不说了
+                    // 只提一个： mAllowInconsistentMeasurement = version <= Build.VERSION_CODES.M;
+                    final int childHeight;
+                    if (mUseLargestChild && heightMode != MeasureSpec.EXACTLY) {
+                        childHeight = largestChildHeight;
+                    } else if (lp.height == 0 && (!mAllowInconsistentMeasurement
+                            || heightMode == MeasureSpec.EXACTLY)) {
+                        // This child needs to be laid out from scratch using
+                        // only its share of excess space.
+                        childHeight = share;
+                    } else {
+                        // This child had some intrinsic height to which we
+                        // need to add its share of excess space.
+                        childHeight = child.getMeasuredHeight() + share;
+                    }
+
+                    // measure child
+                    final int childHeightMeasureSpec = MeasureSpec.makeMeasureSpec(
+                            Math.max(0, childHeight), MeasureSpec.EXACTLY);
+                    final int childWidthMeasureSpec = getChildMeasureSpec(widthMeasureSpec,
+                            mPaddingLeft + mPaddingRight + lp.leftMargin + lp.rightMargin,
+                            lp.width);
+                    child.measure(childWidthMeasureSpec, childHeightMeasureSpec);
+
+                    // Child may now not fit in vertical dimension.
+                    childState = combineMeasuredStates(childState, child.getMeasuredState()
+                            & (MEASURED_STATE_MASK>>MEASURED_HEIGHT_STATE_SHIFT));
+                }
+
+                // 计算最大宽度
+                final int margin =  lp.leftMargin + lp.rightMargin;
+                final int measuredWidth = child.getMeasuredWidth() + margin;
+                maxWidth = Math.max(maxWidth, measuredWidth);
+
+                // 前面matchWidthLocally为true时没计算宽度，这里重新计算一下
+                // 就是更新一下alternativeMaxWidth
+                boolean matchWidthLocally = widthMode != MeasureSpec.EXACTLY &&
+                        lp.width == LayoutParams.MATCH_PARENT;
+
+                // 解释一下：因为LinearLayout宽度不定，你只是要撑满它，所以只传进去margin就行了，自己的宽度不重要
+                alternativeMaxWidth = Math.max(alternativeMaxWidth,
+                        matchWidthLocally ? margin : measuredWidth);
+
+                allFillParent = allFillParent && lp.width == LayoutParams.MATCH_PARENT;
+
+                // 更新mTotalLength
+                final int totalLength = mTotalLength;
+                mTotalLength = Math.max(totalLength, totalLength + child.getMeasuredHeight() +
+                        lp.topMargin + lp.bottomMargin + getNextLocationOffset(child));
+            }
+
+            // Add in our padding
+            mTotalLength += mPaddingTop + mPaddingBottom;
+            // TODO: Should we recompute the heightSpec based on the new total length?
+        } else {
+            // 不需要上面那么麻烦重新算了，直接更新，然后measure child就完事了
+            alternativeMaxWidth = Math.max(alternativeMaxWidth,
+                                           weightedMaxWidth);
+
+            // We have no limit, so make all weighted views as tall as the largest child.
+            // Children will have already been measured once.
+            if (useLargestChild && heightMode != MeasureSpec.EXACTLY) {
+                for (int i = 0; i < count; i++) {
+                    final View child = getVirtualChildAt(i);
+                    if (child == null || child.getVisibility() == View.GONE) {
+                        continue;
+                    }
+
+                    final LinearLayout.LayoutParams lp =
+                            (LinearLayout.LayoutParams) child.getLayoutParams();
+
+                    float childExtra = lp.weight;
+                    if (childExtra > 0) {
+                        child.measure(
+                                MeasureSpec.makeMeasureSpec(child.getMeasuredWidth(),
+                                        MeasureSpec.EXACTLY),
+                                MeasureSpec.makeMeasureSpec(largestChildHeight,
+                                        MeasureSpec.EXACTLY));
+                    }
+                }
+            }
+        }
+```
+
+### Last but not the least
+
+```
+        // 更新最大宽度
+        if (!allFillParent && widthMode != MeasureSpec.EXACTLY) {
+            maxWidth = alternativeMaxWidth;
+        }
+
+        maxWidth += mPaddingLeft + mPaddingRight;
+
+        // Check against our minimum width
+        maxWidth = Math.max(maxWidth, getSuggestedMinimumWidth());
+
+        // 设置MeasuredDimension
+        setMeasuredDimension(resolveSizeAndState(maxWidth, widthMeasureSpec, childState),
+                heightSizeAndState);
+
+        // 最后，如果我们有MATCH_PARENT的child，还需要重新measure它们的width
+        if (matchWidth) {
+            forceUniformWidth(count, heightMeasureSpec);
+        }
+```
+
+```
+    private void forceUniformWidth(int count, int heightMeasureSpec) {
+        // Pretend that the linear layout has an exact size.
+        // 宽度为 EXACTLY mode
+        int uniformMeasureSpec = MeasureSpec.makeMeasureSpec(getMeasuredWidth(),
+                MeasureSpec.EXACTLY);
+        for (int i = 0; i< count; ++i) {
+           final View child = getVirtualChildAt(i);
+           if (child != null && child.getVisibility() != GONE) {
+               LinearLayout.LayoutParams lp = ((LinearLayout.LayoutParams)child.getLayoutParams());
+
+               // 宽度为MATCH_PARENT的child，保存height，重新measure之后，再把height赋值回去；
+               // 这样就只改变了width
+               if (lp.width == LayoutParams.MATCH_PARENT) {
+                   // Temporarily force children to reuse their old measured height
+                   // FIXME: this may not be right for something like wrapping text?
+                   int oldHeight = lp.height;
+                   lp.height = child.getMeasuredHeight();
+
+                   // Remeasue with new dimensions
+                   measureChildWithMargins(child, uniformMeasureSpec, 0, heightMeasureSpec, 0);
+                   lp.height = oldHeight;
+               }
+           }
+        }
+    }
+```
+
+至此，我们也就看完了竖直方向measure的全过程。我们尝试用一段伪代码来总结一下：
+
+```
+void measureVertical(int widthMeasureSpec, int heightMeasureSpec) {
+
+		初始化变量(measure过程中需要记录的各种数值、状态、标记等)；
+		
+		for () {
+			第一个for循环，算高度、算宽度，略过带weight的child
+		}
+		
+		for () {
+			第二个for循环：useLargestChild的情况下，parent的大小不固定时，把child高度都换成最大高度
+		}
+		
+		for () {
+			第三次循环：如果我们之前跳过了带weight的child的measure，或是totalWeight > 0，就需要重新计算一遍，因为现在我们知道了LinearLayout的高度
+			在这次循环里，调用了child.measure
+		}
+		
+		measureMATCH_PARENT的child的宽度（因为我们这个是竖直方向的，宽度没重新measure）
+}
+```
+
+---
+
+# 写在后面
+
+完整代码见：[Github:jio-deng/LinearLayout-onMeasure源码解析][4]
+
+
+[1]:https://www.cnblogs.com/duanweishi/p/4244473.html
+[2]:https://blog.csdn.net/a87b01c14/article/details/49420449
+[3]:https://www.jianshu.com/p/1fc54f1cb1d8
+[4]:https://github.com/jio-deng/Blog/blob/master/202102/LinearLayout-onMeasure%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90
+[5]:https://blog.csdn.net/xiayong1/article/details/53780745
+
+
+
+
+
 ```
     /**
      * Measures the children when the orientation of this LinearLayout is set
